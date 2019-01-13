@@ -1,0 +1,164 @@
+# Obtain run_ids from centroided DIA mzXML files in dia_data folder
+run_ids, = glob_wildcards("data_dia/{run}.mzXML")
+
+rule all:
+    input:
+        "tric_feature_alignment.done"
+
+rule run_target_pqp:
+    input:
+        "/project/6011811/openswath_orbitrap/lfqbench_running_parameter/results/library/{run}_Q1_run_peaks.tsv"
+    output:
+        "results/openswath/{run}.pqp"
+    singularity:
+        "develop.simg"
+    shell:
+        "OpenSwathAssayGenerator -in {input} -out {output}"
+
+rule irt_filter_pqp:
+    input:
+        rules.run_target_pqp.output
+    params:
+        bins = 10,
+        peptides = 5
+    output:
+        "results/openswath/irt_{run}.pqp"
+    singularity:
+        "develop.simg"
+    script:
+        "scripts/hrirt.R"
+
+rule irt_nonlinear_filter_pqp:
+    input:
+        rules.run_target_pqp.output
+    params:
+        bins = 1000,
+        peptides = 5
+    output:
+        "results/openswath/irt_nonlinear_{run}.pqp"
+    singularity:
+        "develop.simg"
+    script:
+        "scripts/hrirt.R"
+
+rule openswath:
+    input:
+        pqp="/project/6011811/openswath_orbitrap/lfqbench_running_parameter/data_library/library.pqp",
+        irt_linear=rules.irt_filter_pqp.output,
+        irt_nonlinear=rules.irt_nonlinear_filter_pqp.output,
+        mzxml="/project/6011811/openswath_orbitrap/lfqbench_running_parameter/data_dia/{run}.mzXML",
+    output:
+        osw="results/openswath/{run}.osw"
+    params:
+        cache="/tmp/{run}/"
+    singularity:
+        "develop.simg"
+    threads: 4
+    resources:
+        mem_mb=lambda wildcards, attempt: attempt * 8192
+    shell:
+            "mkdir -p {params.cache} && "
+        "OpenSwathWorkflow -in {input.mzxml} -tr {input.pqp} -tr_irt {input.irt_linear} -tr_irt_nonlinear {input.irt_nonlinear} -out_osw {output.osw} -threads {threads} -min_upper_edge_dist 1 -mz_extraction_window 30 -mz_extraction_window_unit ppm -mz_extraction_window_ms1 20 -mz_extraction_window_ms1_unit ppm -mz_correction_function regression_delta_ppm -use_ms1_traces -irt_mz_extraction_window 50 -irt_mz_extraction_window_unit ppm -rt_extraction_window 600 -RTNormalization:estimateBestPeptides -RTNormalization:alignmentMethod lowess -RTNormalization:outlierMethod none -Scoring:stop_report_after_feature 5 -Scoring:TransitionGroupPicker:compute_peak_quality false -Scoring:Scores:use_ms1_mi -Scoring:Scores:use_mi_score -threads {threads} -readOptions cache -tempDirectory {params.cache} -batchSize 1000 -ms1_isotopes 3 && " # -enable_uis_scoring
+        "rm -rf {params.cache}"
+
+rule pyprophet_subsample:
+    input:
+        rules.openswath.output.osw
+    params:
+        subsample_ratio = lambda wildcards, input: round(1.0/len(set(rules.openswath.output.osw)),3)
+    output:
+        "results/pyprophet/runspecific/{run}.osws"
+    singularity:
+        "develop.simg"
+    threads: 1
+    shell:
+        "pyprophet subsample --subsample_ratio={params.subsample_ratio} --in={input} --out={output}"
+
+rule pyprophet_merge:
+    input:
+        template = rules.openswath.input.pqp,
+        osws = expand("results/pyprophet/runspecific/{run}.osws", run=run_ids)
+    output:
+        "results/pyprophet/runspecific/subsampled.osw"
+    singularity:
+        "develop.simg"
+    threads: 1
+    shell:
+        "pyprophet merge --template={input.template} --out={output} {input.osws}"
+
+rule pyprophet_learn:
+    input:
+        rules.pyprophet_merge.output
+    output:
+        ms1ms2 = "results/pyprophet/runspecific/subsampled_ms1ms2_model.bin",
+        ms1ms2_report = "results/pyprophet/runspecific/subsampled_ms1ms2_report.pdf"
+    singularity:
+        "develop.simg"
+    threads: 4
+    shell:
+        "pyprophet score --classifier=XGBoost --in {input} --level=ms1ms2 --ss_initial_fdr=0.01 --ss_iteration_fdr=0.001 --threads={threads}"
+        # "pyprophet score --in {output} --level=ms1 && "
+        # "pyprophet score --in {output} --level=transition"
+
+rule pyprophet_apply:
+    input:
+        osw = rules.openswath.output.osw,
+        ms1ms2 = rules.pyprophet_learn.output.ms1ms2
+    output:
+        osw = "results/pyprophet/runspecific/{run}.osw",
+        oswr = "results/pyprophet/runspecific/{run}.oswr"
+    singularity:
+        "develop.simg"
+    shell:
+        "pyprophet score --in {input.osw} --out {output.osw} --classifier=XGBoost --apply_weights={input.ms1ms2} --level=ms1ms2 && "
+        # "pyprophet score --in {output.osw} --apply_weights {input.model} --level=ms1 && "
+        # "pyprophet score --in {output.osw} --apply_weights {input.model} --level=transition && "
+        # "pyprophet ipf --no-ipf_ms1_scoring --in {output.osw} && "
+        "pyprophet reduce --in {output.osw} --out {output.oswr}"
+
+rule pyprophet_global:
+    input:
+        template = rules.openswath.input.pqp,
+        oswr = expand("results/pyprophet/runspecific/{run}.oswr", run=run_ids)
+    output:
+        "results/pyprophet/global/model.oswr"
+    singularity:
+        "develop.simg"
+    shell:
+        "pyprophet merge --template {input.template} --out {output} {input.oswr} && "
+        "pyprophet peptide --context=global --in {output} && "
+        "pyprophet protein --context=global --in {output}"
+
+rule pyprophet_backpropagate:
+    input:
+        osw = rules.pyprophet_apply.output.osw,
+        model = rules.pyprophet_global.output
+    output:
+        "results/pyprophet/integrated/{run}.osw"
+    singularity:
+        "develop.simg"
+    shell:
+        "pyprophet backpropagate --apply_scores {input.model} --in {input.osw}  --out {output} && "
+        "pyprophet export --in {output}"
+
+rule tric_prepare:
+    input:
+        rules.pyprophet_backpropagate.output
+    output:
+        "results/tric/{run}.mzXML.tsv"
+    singularity:
+        "develop.simg"
+    shell:
+        "pyprophet export --in={input} && mv $(basename {output}) {output}"
+
+rule tric_feature_alignment:
+    input:
+        expand("results/tric/{run}.mzXML.tsv", run=run_ids)
+    output:
+        long="results/tric/feature_alignment.tsv",
+        matrix="results/tric/feature_alignment_matrix.tsv",
+        check=temp(touch("tric_feature_alignment.done"))
+    singularity:
+        "develop.simg"
+    shell:
+        "feature_alignment.py --in {input} --out {output.long} --out_matrix {output.matrix} --method LocalMST --realign_method lowess_cython --max_rt_diff 60 --mst:useRTCorrection True --mst:Stdev_multiplier 3.0 --target_fdr 0.01 --max_fdr_quality 0.05"

@@ -1,3 +1,6 @@
+# This script assign the following values to the mz_extraction_window parameter, and put the newly created/modified Snakefile 
+# into different directories.
+
 for i in 0.05 10 20 30 40 50 60 70 80 90 100
 do
         mkdir -p D2/$i

@@ -1,4 +1,8 @@
 # Obtain run_ids from centroided DIA mzXML files in dia_data folder
+# the workflow first generates a set of anchor peptides for the linear and nonlinear retention time calibration. Then, 
+# OpenSWATH (version 0.2.0) was used for the DIA-based targeted protein analysis. The discriminant scores were then generated 
+# by pyProphet (version 2.0.1), and the workflow was finished with the cross-run realignment by TRIC (master version).
+
 run_ids, = glob_wildcards("data_dia/{run}.mzXML")
 
 rule all:
